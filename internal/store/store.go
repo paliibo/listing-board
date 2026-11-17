@@ -209,6 +209,50 @@ func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
 	return nil
 }
 
+// RunningJobs returns every running sheet, the one waiting longest first, so
+// that no sheet is starved when the worker falls behind.
+func (s *Store) RunningJobs(ctx context.Context) ([]board.Job, error) {
+	rows, err := s.db.QueryContext(ctx, jobSelect+` WHERE status = 'running' ORDER BY updated_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []board.Job
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// SaveProgress writes the worker's fields of next, but only while the row is
+// still the running sheet the worker read as seen. Another worker instance may
+// have moved it on since, and two writers deciding on the same read must not
+// both win; the loser gets false and skips the sheet. run_id, filename, title
+// and address are never written here: they belong to the API.
+func (s *Store) SaveProgress(ctx context.Context, seen, next board.Job) (bool, error) {
+	raw, err := json.Marshal(next.Checklist)
+	if err != nil {
+		return false, err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE jobs
+		SET status = $1, error = $2, checklist = $3, updated_at = $4
+		WHERE id = $5 AND status = 'running' AND updated_at = $6
+	`, next.Status, next.Error, string(raw), next.UpdatedAt.UTC(), seen.ID, seen.UpdatedAt.UTC())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 const jobSelect = `
 	SELECT id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at
 	FROM jobs`

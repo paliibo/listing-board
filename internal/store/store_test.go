@@ -232,3 +232,166 @@ func TestWaitStopsWhenItsContextIsDone(t *testing.T) {
 		}
 	}
 }
+
+// start moves a draft to running through the API's own write, as POST /start does.
+func start(t *testing.T, st *Store, draft board.Job, at time.Time) board.Job {
+	t.Helper()
+	job := running(draft)
+	job.UpdatedAt = at
+	if err := st.UpdateJob(context.Background(), job); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	return job
+}
+
+func TestRunningJobsListsRunningSheetsOldestFirst(t *testing.T) {
+	t.Parallel()
+	st := openStore(t, freshDatabase(t))
+	ctx := context.Background()
+	ada := newUser(t, st, "ada@example.com")
+	grace := newUser(t, st, "grace@example.com")
+	linus := newUser(t, st, "linus@example.com")
+	base := time.Now().UTC().Truncate(time.Microsecond)
+
+	newer := start(t, st, newDraft(t, st, ada.ID), base.Add(time.Minute))
+	older := start(t, st, newDraft(t, st, grace.ID), base)
+	newDraft(t, st, ada.ID)
+	finished := start(t, st, newDraft(t, st, linus.ID), base.Add(-time.Minute))
+	done := finished
+	done.Status = board.StatusSuccess
+	done.UpdatedAt = base.Add(-time.Second)
+	if ok, err := st.SaveProgress(ctx, finished, done); err != nil || !ok {
+		t.Fatalf("finish a sheet: %v, %v", ok, err)
+	}
+
+	jobs, err := st.RunningJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("%d running sheets, want 2: %+v", len(jobs), jobs)
+	}
+	for i, want := range []board.Job{older, newer} {
+		got := jobs[i]
+		if got.ID != want.ID || got.UserID != want.UserID || got.RunID != want.RunID ||
+			got.Status != "running" || !got.UpdatedAt.Equal(want.UpdatedAt) {
+			t.Fatalf("sheet %d is %+v, want %+v", i, got, want)
+		}
+	}
+}
+
+func TestSaveProgressWritesOnlyTheWorkersFields(t *testing.T) {
+	t.Parallel()
+	st := openStore(t, freshDatabase(t))
+	ctx := context.Background()
+	user := newUser(t, st, "ada@example.com")
+	seen := start(t, st, newDraft(t, st, user.ID), time.Now().UTC().Truncate(time.Microsecond))
+
+	next := seen
+	next.Checklist = slices.Clone(seen.Checklist)
+	next.Checklist[0].State = board.StepDone
+	next.Status = board.StatusFailed
+	next.Error = "Brochure is missing"
+	next.UpdatedAt = seen.UpdatedAt.Add(2 * time.Second)
+	next.RunID = "another run"
+	next.Filename = "other.pdf"
+	next.Title = "Other title"
+	next.Address = "Other address"
+	ok, err := st.SaveProgress(ctx, seen, next)
+	if err != nil || !ok {
+		t.Fatalf("save: %v, %v", ok, err)
+	}
+	got, err := st.Job(ctx, seen.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "failed" || got.Error != "Brochure is missing" || !slices.Equal(got.Checklist, next.Checklist) ||
+		!got.UpdatedAt.Equal(next.UpdatedAt) {
+		t.Fatalf("worker fields: %+v, want %+v", got, next)
+	}
+	if got.RunID != seen.RunID || got.Filename != seen.Filename || got.Title != seen.Title || got.Address != seen.Address {
+		t.Fatalf("API fields changed: %+v, want %+v", got, seen)
+	}
+}
+
+func TestSaveProgressSkipsASheetThatChanged(t *testing.T) {
+	t.Parallel()
+	st := openStore(t, freshDatabase(t))
+	ctx := context.Background()
+	user := newUser(t, st, "ada@example.com")
+	other := newUser(t, st, "grace@example.com")
+	at := time.Now().UTC().Truncate(time.Microsecond)
+
+	draft := newDraft(t, st, user.ID)
+	runningSheet := start(t, st, newDraft(t, st, other.ID), at)
+
+	cases := []struct {
+		name string
+		seen board.Job
+		want board.Job
+	}{
+		// A draft belongs to the API, even when updated_at matches.
+		{"not running", running(draft), draft},
+		{"stale updated_at", func() board.Job {
+			stale := runningSheet
+			stale.UpdatedAt = at.Add(-time.Second)
+			return stale
+		}(), runningSheet},
+	}
+	for _, c := range cases {
+		next := c.seen
+		next.Checklist = slices.Clone(c.seen.Checklist)
+		next.Checklist[0].State = board.StepDone
+		next.UpdatedAt = at.Add(time.Hour)
+		ok, err := st.SaveProgress(ctx, c.seen, next)
+		if err != nil || ok {
+			t.Fatalf("%s: save returned %v, %v; want false, nil", c.name, ok, err)
+		}
+		got, err := st.Job(ctx, c.want.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != c.want.Status || !slices.Equal(got.Checklist, c.want.Checklist) ||
+			!got.UpdatedAt.Equal(c.want.UpdatedAt) {
+			t.Fatalf("%s: row changed: %+v, want %+v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestASheetReadBackCanBeSavedAgain(t *testing.T) {
+	t.Parallel()
+	st := openStore(t, freshDatabase(t))
+	ctx := context.Background()
+	user := newUser(t, st, "ada@example.com")
+	// Nanoseconds that Postgres cannot keep, as time.Now gives them.
+	at := time.Now().UTC().Truncate(time.Microsecond).Add(789 * time.Nanosecond)
+	start(t, st, newDraft(t, st, user.ID), at)
+
+	for step := range 3 {
+		jobs, err := st.RunningJobs(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("step %d: %d running sheets, want 1", step, len(jobs))
+		}
+		seen := jobs[0]
+		next := seen
+		next.Checklist = slices.Clone(seen.Checklist)
+		next.Checklist[step].State = board.StepDone
+		next.UpdatedAt = time.Now().Add(time.Duration(step+1) * 123 * time.Nanosecond)
+		ok, err := st.SaveProgress(ctx, seen, next)
+		if err != nil || !ok {
+			t.Fatalf("step %d: save of a sheet read back returned %v, %v", step, ok, err)
+		}
+	}
+	jobs, err := st.RunningJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range jobs[0].Checklist {
+		if step.State != "done" {
+			t.Fatalf("checklist %+v, want every step done", jobs[0].Checklist)
+		}
+	}
+}
