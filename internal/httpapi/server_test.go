@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -85,6 +87,64 @@ func TestStartRequiresASession(t *testing.T) {
 	}
 }
 
+func TestSheetsOfAnotherAccountAreNotFound(t *testing.T) {
+	t.Parallel()
+	srv, dir := newTestServer(t)
+	ada := signUp(t, srv, "ada@example.com")
+	grace := signUp(t, srv, "grace@example.com")
+	brochure := []byte("%PDF-1.4\n")
+	job := createSheet(t, srv, ada, "Market loft", "10 Market Street")
+	uploadFile(t, srv, ada, job.ID, "brochure.pdf", brochure, "application/pdf")
+	before := filesUnder(t, dir)
+	unknown := board.NewID()
+
+	routes := []struct {
+		name string
+		call func(id string) *httptest.ResponseRecorder
+	}{
+		{"get the sheet", func(id string) *httptest.ResponseRecorder {
+			return call(srv, http.MethodGet, "/api/jobs/"+id, grace, nil, "")
+		}},
+		{"start the sheet", func(id string) *httptest.ResponseRecorder {
+			return call(srv, http.MethodPost, "/api/jobs/"+id+"/start", grace, nil, "")
+		}},
+		{"attach a brochure", func(id string) *httptest.ResponseRecorder {
+			return postFile(t, srv, grace, id, "notes.txt", []byte("not yours"), "text/plain")
+		}},
+		{"download the brochure", func(id string) *httptest.ResponseRecorder {
+			return call(srv, http.MethodGet, "/api/jobs/"+id+"/file", grace, nil, "")
+		}},
+	}
+	for _, route := range routes {
+		missing := route.call(unknown)
+		if missing.Code != http.StatusNotFound {
+			t.Errorf("%s, unknown sheet: status %d, want 404", route.name, missing.Code)
+		}
+		theirs := route.call(job.ID)
+		if theirs.Code != http.StatusNotFound {
+			t.Errorf("%s, another account's sheet: status %d, want 404", route.name, theirs.Code)
+		}
+		// The answer is the one an unknown id gets, so the id alone gives nothing away.
+		if theirs.Body.String() != missing.Body.String() {
+			t.Errorf("%s: body %q for another account's sheet, %q for an unknown one",
+				route.name, theirs.Body.String(), missing.Body.String())
+		}
+	}
+
+	// Nothing the other account tried reached the owner's sheet or its files.
+	got := getSheet(t, srv, ada, job.ID)
+	if got.Status != "draft" || got.RunID != "" || got.Filename != "brochure.pdf" {
+		t.Errorf("the owner's sheet changed: status %q, runId %q, filename %q", got.Status, got.RunID, got.Filename)
+	}
+	if after := filesUnder(t, dir); !slices.Equal(after, before) {
+		t.Errorf("files under the data dir are %v, were %v", after, before)
+	}
+	own := call(srv, http.MethodGet, "/api/jobs/"+job.ID+"/file", ada, nil, "")
+	if own.Code != http.StatusOK || !bytes.Equal(own.Body.Bytes(), brochure) {
+		t.Errorf("the owner's download: status %d, body %q", own.Code, own.Body.String())
+	}
+}
+
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -119,6 +179,15 @@ func createSheet(t *testing.T, srv *Server, cookie, title, address string) board
 
 func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) {
 	t.Helper()
+	res := postFile(t, srv, cookie, id, name, data, contentType)
+	if res.Code != http.StatusOK {
+		t.Fatalf("upload %d: %s", res.Code, res.Body.String())
+	}
+}
+
+// postFile sends one brochure upload and returns the answer, whatever it is.
+func postFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) *httptest.ResponseRecorder {
+	t.Helper()
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	header := textproto.MIMEHeader{}
@@ -134,10 +203,58 @@ func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte,
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	res := call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, &buf, writer.FormDataContentType())
+	return call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, &buf, writer.FormDataContentType())
+}
+
+func getSheet(t *testing.T, srv *Server, cookie, id string) board.Job {
+	t.Helper()
+	res := call(srv, http.MethodGet, "/api/jobs/"+id, cookie, nil, "")
 	if res.Code != http.StatusOK {
-		t.Fatalf("upload %d: %s", res.Code, res.Body.String())
+		t.Fatalf("get sheet %d: %s", res.Code, res.Body.String())
 	}
+	return decodeJob(t, res)
+}
+
+// accountID asks the API who the session belongs to.
+func accountID(t *testing.T, srv *Server, cookie string) string {
+	t.Helper()
+	res := call(srv, http.MethodGet, "/api/me", cookie, nil, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("me %d: %s", res.Code, res.Body.String())
+	}
+	var me struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &me); err != nil {
+		t.Fatal(err)
+	}
+	if me.ID == "" {
+		t.Fatal("me has no id")
+	}
+	return me.ID
+}
+
+// filesUnder lists every file below root, relative to it, in walk order.
+func filesUnder(t *testing.T, root string) []string {
+	t.Helper()
+	files := []string{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			files = append(files, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
 }
 
 func decodeJob(t *testing.T, res *httptest.ResponseRecorder) board.Job {

@@ -183,7 +183,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		UserID:    user.ID,
 		Title:     title,
 		Address:   address,
-		Status:    "draft",
+		Status:    board.StatusDraft,
 		Checklist: board.NewChecklist(),
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -196,19 +196,23 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
 }
 
-func (s *Server) load(w http.ResponseWriter, r *http.Request) (board.Job, bool) {
+// load finds the sheet named in the path for the account that asks for it.
+// A sheet that belongs to another account gets the same answer as one that
+// does not exist, so an id alone tells a stranger nothing.
+func (s *Server) load(w http.ResponseWriter, r *http.Request, user board.User) (board.Job, bool) {
 	job, err := s.store.Job(r.Context(), r.PathValue("id"))
-	if errors.Is(err, board.ErrNotFound) {
+	if errors.Is(err, board.ErrNotFound) || (err == nil && job.UserID != user.ID) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return board.Job{}, false
 	}

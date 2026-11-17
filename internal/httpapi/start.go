@@ -9,10 +9,11 @@ import (
 )
 
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
