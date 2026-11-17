@@ -451,6 +451,11 @@ button.row.on {
   margin-block-start: 5px;
 }
 
+/* On the open sheet the step in hand already turns; one moving mark is enough. */
+.sheet-head .status::before {
+  animation: none;
+}
+
 .sheet button {
   justify-self: start;
 }
