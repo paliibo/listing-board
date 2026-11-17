@@ -145,6 +145,32 @@ func TestSheetsOfAnotherAccountAreNotFound(t *testing.T) {
 	}
 }
 
+func TestAccountLocksAdmitOneRequestPerAccount(t *testing.T) {
+	t.Parallel()
+	var locks accountLocks
+	const requests = 64
+	inside, visits := 0, 0
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			unlock := locks.lock("ada")
+			defer unlock()
+			inside++
+			if inside != 1 {
+				t.Errorf("%d requests hold the account's lock at once", inside)
+			}
+			visits++
+			inside--
+		}()
+	}
+	wg.Wait()
+	if visits != requests {
+		t.Fatalf("%d of %d requests got the lock", visits, requests)
+	}
+}
+
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()

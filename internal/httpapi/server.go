@@ -19,6 +19,7 @@ type Server struct {
 	dataDir string
 	webDir  string
 	handler http.Handler
+	locks   accountLocks
 }
 
 type account struct {
