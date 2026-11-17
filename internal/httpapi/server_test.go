@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -307,12 +308,462 @@ func TestSimultaneousStartsOfTwoDraftsAdmitOne(t *testing.T) {
 func TestUploadKeepsTheClientFilename(t *testing.T) {
 	srv, dir := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
+	userID := accountID(t, srv, cookie)
 	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
-	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	brochure := []byte("%PDF-1.4\n")
+	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", brochure, "application/pdf")
 
-	path := filepath.Join(dir, job.ID, "brochure.pdf")
-	if _, err := os.Stat(path); err != nil {
+	// The name the client gave is kept in the sheet's filename field...
+	if got := getSheet(t, srv, cookie, job.ID).Filename; got != "brochure.pdf" {
+		t.Fatalf("filename %q, want brochure.pdf", got)
+	}
+	// ...and only there: the bytes are stored at {DATA_DIR}/{userID}/{jobID}/body.
+	path := filepath.Join(dir, userID, job.ID, "body")
+	stored, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatalf("brochure was not stored at %s: %v", path, err)
+	}
+	if !bytes.Equal(stored, brochure) {
+		t.Fatalf("stored %q, want %q", stored, brochure)
+	}
+	want := []string{filepath.Join(userID, job.ID, "body")}
+	if files := filesUnder(t, dir); !slices.Equal(files, want) {
+		t.Fatalf("files under the data dir are %v, want %v", files, want)
+	}
+}
+
+func TestFilenamesThatLeaveTheDirectoryStayData(t *testing.T) {
+	t.Parallel()
+	names := []string{
+		"../../escaped.txt",
+		"../../../../escaped.txt",
+		"/etc/escaped.txt",
+		`..\..\escaped.txt`,
+		"a/b/c.txt",
+	}
+	for _, name := range names {
+		parent := t.TempDir()
+		dir := filepath.Join(parent, "data")
+		srv := New(newMem(), dir, "")
+		cookie := signUp(t, srv, "ada@example.com")
+		userID := accountID(t, srv, cookie)
+		job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+		res := postFile(t, srv, cookie, job.ID, name, []byte("plain text\n"), "text/plain")
+		if res.Code != http.StatusOK {
+			t.Errorf("%q: status %d: %s", name, res.Code, res.Body.String())
+			continue
+		}
+		if got := decodeJob(t, res).Filename; got != name {
+			t.Errorf("%q: answered filename %q", name, got)
+		}
+		if got := getSheet(t, srv, cookie, job.ID).Filename; got != name {
+			t.Errorf("%q: stored filename %q", name, got)
+		}
+		want := []string{filepath.Join("data", userID, job.ID, "body")}
+		if files := filesUnder(t, parent); !slices.Equal(files, want) {
+			t.Errorf("%q: files are %v, want %v", name, files, want)
+		}
+	}
+}
+
+func TestBrochureSizeLimitIsOneMiB(t *testing.T) {
+	t.Parallel()
+	const mib = 1 << 20
+	pdf := func(n int) []byte { return append([]byte("%PDF-"), bytes.Repeat([]byte{'x'}, n-5)...) }
+	text := func(n int) []byte { return bytes.Repeat([]byte{'x'}, n) }
+	cases := []struct {
+		name string
+		data []byte
+		want int
+	}{
+		{"text of exactly 1 MiB", text(mib), http.StatusOK},
+		{"pdf of exactly 1 MiB", pdf(mib), http.StatusOK},
+		{"text one byte over", text(mib + 1), http.StatusBadRequest},
+		{"pdf one byte over", pdf(mib + 1), http.StatusBadRequest},
+		{"text of 3 MiB", text(3 * mib), http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		srv, dir := newTestServer(t)
+		cookie := signUp(t, srv, "ada@example.com")
+		job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+		res := postFile(t, srv, cookie, job.ID, "brochure.txt", c.data, "text/plain")
+		if res.Code != c.want {
+			t.Errorf("%s: status %d, want %d: %s", c.name, res.Code, c.want, res.Body.String())
+			continue
+		}
+		if c.want == http.StatusOK {
+			continue
+		}
+		if got := errorText(t, res); got != "Brochure is too large" {
+			t.Errorf("%s: error %q, want %q", c.name, got, "Brochure is too large")
+		}
+		assertNothingAttached(t, srv, cookie, job.ID, dir)
+	}
+}
+
+func TestBrochureTypeComesFromTheBytes(t *testing.T) {
+	t.Parallel()
+	filler := bytes.Repeat([]byte("a"), 600)
+	cases := []struct {
+		name        string
+		filename    string
+		contentType string
+		data        []byte
+		ok          bool
+	}{
+		{"pdf bytes named .txt, sent as text", "notes.txt", "text/plain", []byte("%PDF-1.4\n"), true},
+		{"text named .pdf, sent as pdf", "scan.pdf", "application/pdf", []byte("just words\n"), true},
+		{"pdf header followed by binary", "scan.pdf", "application/pdf", []byte("%PDF-1.4\n\x00\xff\xfe\x80"), true},
+		{"pdf header alone", "scan.pdf", "application/pdf", []byte("%PDF-"), true},
+		{"text that looks like html", "page.html", "text/html", []byte("<!DOCTYPE html><html><body>hi</body></html>"), true},
+		{"text with a BOM", "notes.txt", "text/plain", []byte("\xef\xbb\xbfhello"), true},
+		{"non-ASCII text", "notes.txt", "text/plain", []byte("Квартира на Ринковій, 10 \u00e9\u4e2d"), true},
+		{"text with a control byte", "notes.txt", "text/plain", []byte("a\x01b"), true},
+		{"bytes that are neither", "scan.pdf", "application/pdf", []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe}, false},
+		{"text with a NUL", "notes.txt", "text/plain", []byte("a\x00b"), false},
+		{"invalid UTF-8", "notes.txt", "text/plain", []byte("caf\xe9"), false},
+		{"NUL at byte 600", "notes.txt", "text/plain", append(slices.Clone(filler), 0, 'b'), false},
+		{"invalid byte at byte 600", "notes.txt", "text/plain", append(slices.Clone(filler), 0xff, 'b'), false},
+		{"UTF-16 with a BOM", "notes.txt", "text/plain", []byte("\xff\xfeh\x00i\x00"), false},
+		{"empty file", "notes.txt", "text/plain", []byte{}, false},
+	}
+	for _, c := range cases {
+		srv, dir := newTestServer(t)
+		cookie := signUp(t, srv, "ada@example.com")
+		job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+		res := postFile(t, srv, cookie, job.ID, c.filename, c.data, c.contentType)
+		if c.ok {
+			if res.Code != http.StatusOK {
+				t.Errorf("%s: status %d: %s", c.name, res.Code, res.Body.String())
+			}
+			continue
+		}
+		if res.Code != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400: %s", c.name, res.Code, res.Body.String())
+			continue
+		}
+		if got := errorText(t, res); got != "Brochure must be a PDF or a text file" {
+			t.Errorf("%s: error %q, want %q", c.name, got, "Brochure must be a PDF or a text file")
+		}
+		assertNothingAttached(t, srv, cookie, job.ID, dir)
+	}
+}
+
+func TestASecondUploadIsRefusedAndLeavesTheFirst(t *testing.T) {
+	t.Parallel()
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	first := []byte("first brochure\n")
+	uploadFile(t, srv, cookie, job.ID, "first.txt", first, "text/plain")
+	before := filesUnder(t, dir)
+
+	res := postFile(t, srv, cookie, job.ID, "second.pdf", []byte("%PDF-1.7\n"), "application/pdf")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := errorText(t, res); got != "This sheet already has a brochure" {
+		t.Fatalf("error %q, want %q", got, "This sheet already has a brochure")
+	}
+	if got := getSheet(t, srv, cookie, job.ID).Filename; got != "first.txt" {
+		t.Fatalf("filename %q, want first.txt", got)
+	}
+	files := filesUnder(t, dir)
+	if len(files) != 1 || !slices.Equal(files, before) {
+		t.Fatalf("files under the data dir are %v, were %v", files, before)
+	}
+	stored, err := os.ReadFile(filepath.Join(dir, files[0]))
+	if err != nil || !bytes.Equal(stored, first) {
+		t.Fatalf("stored %q (%v), want %q", stored, err, first)
+	}
+}
+
+func TestSheetsThatHaveStartedTakeNoBrochure(t *testing.T) {
+	t.Parallel()
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+
+	// Started through the API: it has a brochure and is running.
+	started := readySheet(t, srv, cookie, "Market loft")
+	startOK(t, srv, cookie, started.ID)
+	before := filesUnder(t, dir)
+	res := postFile(t, srv, cookie, started.ID, "other.txt", []byte("other"), "text/plain")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("running sheet: status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := getSheet(t, srv, cookie, started.ID); got.Status != "running" || got.Filename != "brochure.pdf" {
+		t.Fatalf("running sheet is %s with filename %q", got.Status, got.Filename)
+	}
+
+	// Sheets without a brochure that are no longer drafts.
+	for _, status := range []string{"running", "success", "failed"} {
+		job := createSheet(t, srv, cookie, "Sheet "+status, "10 Market Street")
+		setSheet(t, srv, job.ID, func(job *board.Job) { job.Status = status })
+
+		res := postFile(t, srv, cookie, job.ID, "late.txt", []byte("late"), "text/plain")
+		if res.Code != http.StatusBadRequest {
+			t.Errorf("%s sheet: status %d, want 400: %s", status, res.Code, res.Body.String())
+			continue
+		}
+		if got := errorText(t, res); got != "This sheet has already been started" {
+			t.Errorf("%s sheet: error %q, want %q", status, got, "This sheet has already been started")
+		}
+		if got := getSheet(t, srv, cookie, job.ID); got.Filename != "" || got.Status != status {
+			t.Errorf("%s sheet changed: status %s, filename %q", status, got.Status, got.Filename)
+		}
+	}
+	if after := filesUnder(t, dir); !slices.Equal(after, before) {
+		t.Errorf("files under the data dir are %v, were %v", after, before)
+	}
+}
+
+func TestUploadNeedsAFileWithAUsableName(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		filename string
+		ok       bool
+	}{
+		{"only spaces", "   ", false},
+		{"256 bytes", strings.Repeat("a", 252) + ".txt", false},
+		{"a tab", "bro\tchure.txt", false},
+		{"a C1 control character", "bro\u0085chure.txt", false},
+		{"255 bytes", strings.Repeat("a", 251) + ".txt", true},
+		{"non-ASCII", "план будинку.pdf", true},
+	}
+	for _, c := range cases {
+		srv, dir := newTestServer(t)
+		cookie := signUp(t, srv, "ada@example.com")
+		job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+		res := postFile(t, srv, cookie, job.ID, c.filename, []byte("%PDF-1.4\n"), "application/pdf")
+		if c.ok {
+			if res.Code != http.StatusOK {
+				t.Errorf("%s: status %d: %s", c.name, res.Code, res.Body.String())
+			} else if got := getSheet(t, srv, cookie, job.ID).Filename; got != c.filename {
+				t.Errorf("%s: filename %q, want %q", c.name, got, c.filename)
+			}
+			continue
+		}
+		if res.Code != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400: %s", c.name, res.Code, res.Body.String())
+			continue
+		}
+		if got := errorText(t, res); got != "Choose a brochure file" {
+			t.Errorf("%s: error %q, want %q", c.name, got, "Choose a brochure file")
+		}
+		assertNothingAttached(t, srv, cookie, job.ID, dir)
+	}
+
+	// A body with no file part at all.
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	if err := writer.WriteField("title", "not a file"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/file", cookie, &buf, writer.FormDataContentType())
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("no file part: status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := errorText(t, res); got != "Choose a brochure file" {
+		t.Fatalf("no file part: error %q, want %q", got, "Choose a brochure file")
+	}
+	assertNothingAttached(t, srv, cookie, job.ID, dir)
+}
+
+func TestSimultaneousUploadsAttachOneFile(t *testing.T) {
+	t.Parallel()
+	srv, dir := newSlowServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	userID := accountID(t, srv, cookie)
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	const uploads = 8
+	results := make([]*httptest.ResponseRecorder, uploads)
+	var ready, wg sync.WaitGroup
+	gate := make(chan struct{})
+	for i := range results {
+		ready.Add(1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready.Done()
+			<-gate
+			results[i] = postFile(t, srv, cookie, job.ID, fmt.Sprintf("file-%d.txt", i), []byte(fmt.Sprintf("content %d\n", i)), "text/plain")
+		}()
+	}
+	ready.Wait()
+	close(gate)
+	wg.Wait()
+
+	accepted := 0
+	for i, res := range results {
+		switch res.Code {
+		case http.StatusOK:
+			accepted++
+		case http.StatusBadRequest:
+		default:
+			t.Errorf("upload %d: status %d: %s", i, res.Code, res.Body.String())
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("%d uploads accepted, want 1", accepted)
+	}
+	name := getSheet(t, srv, cookie, job.ID).Filename
+	var i int
+	if _, err := fmt.Sscanf(name, "file-%d.txt", &i); err != nil {
+		t.Fatalf("stored filename %q: %v", name, err)
+	}
+	stored, err := os.ReadFile(filepath.Join(dir, userID, job.ID, "body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("content %d\n", i); string(stored) != want {
+		t.Fatalf("stored %q for filename %q, want %q", stored, name, want)
+	}
+	if files := filesUnder(t, dir); len(files) != 1 {
+		t.Fatalf("files under the data dir are %v, want one", files)
+	}
+}
+
+func TestAnUploadThatCannotBeSavedLeavesNoFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	store := newMem()
+	srv := New(store, dir, "")
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	// The same accounts and sheets behind a store that can no longer write.
+	broken := New(brokenStore{store}, dir, "")
+
+	res := postFile(t, broken, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500: %s", res.Code, res.Body.String())
+	}
+	assertNothingAttached(t, srv, cookie, job.ID, dir)
+}
+
+func TestAnUploadRequestHasALimitOfItsOwn(t *testing.T) {
+	t.Parallel()
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	// A small, valid file behind 3 MiB of other form data: the file is within
+	// its limit, the request is not.
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	if err := writer.WriteField("padding", strings.Repeat("x", 3<<20)); err != nil {
+		t.Fatal(err)
+	}
+	part, err := writer.CreateFormFile("file", "brochure.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("small\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/file", cookie, &buf, writer.FormDataContentType())
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	assertNothingAttached(t, srv, cookie, job.ID, dir)
+}
+
+func TestDownloadReturnsTheStoredBytes(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	cases := []struct {
+		name        string
+		filename    string
+		uploadType  string
+		data        []byte
+		contentType string
+		disposition string
+	}{
+		{"pdf named .txt", "notes.txt", "text/plain", []byte("%PDF-1.4\n%binary \xff\xfe"), "application/pdf", "attachment"},
+		{"text named .pdf", "scan.pdf", "application/pdf", []byte("plain words\n"), "text/plain", "attachment"},
+		{"a name with directories", "../../escaped.txt", "text/plain", []byte("plain\n"), "text/plain", "attachment"},
+	}
+	for _, c := range cases {
+		job := createSheet(t, srv, cookie, "Sheet", "10 Market Street")
+		uploadFile(t, srv, cookie, job.ID, c.filename, c.data, c.uploadType)
+
+		res := call(srv, http.MethodGet, "/api/jobs/"+job.ID+"/file", cookie, nil, "")
+		if res.Code != http.StatusOK {
+			t.Errorf("%s: status %d: %s", c.name, res.Code, res.Body.String())
+			continue
+		}
+		if !bytes.Equal(res.Body.Bytes(), c.data) {
+			t.Errorf("%s: body %q, want %q", c.name, res.Body.Bytes(), c.data)
+		}
+		if got := res.Header().Get("Content-Type"); !strings.HasPrefix(got, c.contentType) {
+			t.Errorf("%s: Content-Type %q, want %q", c.name, got, c.contentType)
+		}
+		if got := res.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options %q, want nosniff", c.name, got)
+		}
+		got := res.Header().Get("Content-Disposition")
+		if !strings.HasPrefix(got, c.disposition) {
+			t.Errorf("%s: Content-Disposition %q, want it to start with %q", c.name, got, c.disposition)
+		}
+		if c.filename == "../../escaped.txt" {
+			if !strings.Contains(got, "escaped.txt") || strings.Contains(got, "..") || strings.Contains(got, "/") {
+				t.Errorf("%s: Content-Disposition %q should carry only the base name escaped.txt", c.name, got)
+			}
+		}
+	}
+}
+
+func TestDownloadWithoutABrochureIsNotFound(t *testing.T) {
+	t.Parallel()
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	userID := accountID(t, srv, cookie)
+	bare := createSheet(t, srv, cookie, "Bare", "10 Market Street")
+	gone := readySheet(t, srv, cookie, "Gone")
+
+	if res := call(srv, http.MethodGet, "/api/jobs/"+bare.ID+"/file", cookie, nil, ""); res.Code != http.StatusNotFound {
+		t.Errorf("sheet without a brochure: status %d, want 404", res.Code)
+	}
+	if err := os.Remove(filepath.Join(dir, userID, gone.ID, "body")); err != nil {
+		t.Fatal(err)
+	}
+	res := call(srv, http.MethodGet, "/api/jobs/"+gone.ID+"/file", cookie, nil, "")
+	if res.Code != http.StatusNotFound {
+		t.Errorf("sheet whose file is gone: status %d, want 404", res.Code)
+	}
+	if got := errorText(t, res); got != "Not found" {
+		t.Errorf("error %q, want %q", got, "Not found")
+	}
+}
+
+// assertNothingAttached checks that a rejected upload left no trace: the data
+// directory is empty and the sheet still has no brochure.
+func assertNothingAttached(t *testing.T, srv *Server, cookie, id, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("the data dir holds %d entries after a rejected upload, want none", len(entries))
+	}
+	if got := getSheet(t, srv, cookie, id).Filename; got != "" {
+		t.Errorf("filename %q after a rejected upload, want none", got)
 	}
 }
 
@@ -458,6 +909,13 @@ func (s slowStore) ListJobs(ctx context.Context, userID string) ([]board.Job, er
 	jobs, err := s.Store.ListJobs(ctx, userID)
 	time.Sleep(2 * time.Millisecond)
 	return jobs, err
+}
+
+// brokenStore refuses every update, like a database that has gone away.
+type brokenStore struct{ board.Store }
+
+func (brokenStore) UpdateJob(context.Context, board.Job) error {
+	return errors.New("the database is down")
 }
 
 func signUp(t *testing.T, srv *Server, email string) string {
