@@ -18,6 +18,9 @@ type Account = { id: string; email: string };
 
 const MAX_BROCHURE = 1048576;
 const TOO_LARGE = "Brochure is too large";
+// How often the list is fetched: while a sheet is running, and otherwise.
+const POLL_RUNNING = 1000;
+const POLL_IDLE = 3000;
 
 class ApiError extends Error {
   status: number;
@@ -130,9 +133,12 @@ export function App() {
     };
   }, [me]);
 
-  // Poll while something is running: one request at a time, next one scheduled after the previous finished.
+  // Keep the list fresh: one request at a time, the next one scheduled after the previous finished.
+  // It also runs, more slowly, when nothing is running here: a sheet can be started in another tab,
+  // or the answer to Start can get lost, and the page must still follow the worker without a reload.
   useEffect(() => {
-    if (!me || !anyRunning) return;
+    if (!me) return;
+    const wait = anyRunning ? POLL_RUNNING : POLL_IDLE;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
@@ -140,9 +146,9 @@ export function App() {
         const result = await requestList(() => cancelled, true);
         if (result === "stop") return;
       }
-      if (!cancelled) timer = setTimeout(tick, 1000);
+      if (!cancelled) timer = setTimeout(tick, wait);
     };
-    timer = setTimeout(tick, 1000);
+    timer = setTimeout(tick, wait);
     return () => {
       cancelled = true;
       clearTimeout(timer);
@@ -330,7 +336,6 @@ function Create({
         <input
           key={fileKey}
           type="file"
-          accept=".pdf,.txt,application/pdf,text/plain"
           onChange={(event) => setFile(event.target.files?.[0] ?? null)}
           required
         />
@@ -415,7 +420,6 @@ function Sheet({
           <input
             key={fileKey}
             type="file"
-            accept=".pdf,.txt,application/pdf,text/plain"
             onChange={(event) => setFile(event.target.files?.[0] ?? null)}
             required
           />
