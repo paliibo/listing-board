@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 
 type Step = { label: string; state: string };
 
@@ -8,29 +8,100 @@ type Job = {
   address: string;
   status: string;
   error: string;
+  runId: string;
   filename: string;
   checklist: Step[];
+  createdAt: string;
 };
 
 type Account = { id: string; email: string };
 
+const MAX_BROCHURE = 1048576;
+const TOO_LARGE = "Brochure is too large";
+
+class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { credentials: "include", ...init });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  let data: unknown = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
   if (!res.ok) {
-    const message = data && typeof data.error === "string" ? data.error : res.statusText;
-    throw new Error(message);
+    const body = data as { error?: unknown } | null;
+    const message =
+      body && typeof body.error === "string" && body.error
+        ? body.error
+        : res.statusText || "Request failed (" + res.status + ")";
+    throw new ApiError(message, res.status);
   }
   return data as T;
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 export function App() {
   const [me, setMe] = useState<Account | null>(null);
   const [ready, setReady] = useState(false);
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [selected, setSelected] = useState<Job | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState("");
+  // Bumped by every local change to the list; a list answer requested before a bump is stale.
+  const version = useRef(0);
+  // Bumped whenever the user opens a sheet; Create compares it to decide whether to open the new sheet.
+  const openStamp = useRef(0);
+  // True while a list request is in flight, so list requests never overlap.
+  const inFlight = useRef(false);
+
+  const selected = jobs.find((job) => job.id === selectedId) ?? null;
+  const anyRunning = jobs.some((job) => job.status === "running");
+
+  async function requestList(cancelled: () => boolean, quiet: boolean): Promise<"ok" | "stale" | "stop" | "error"> {
+    inFlight.current = true;
+    const seen = version.current;
+    try {
+      const list = await api<Job[]>("/api/jobs");
+      if (cancelled()) return "stop";
+      if (seen !== version.current) return "stale";
+      setJobs(list);
+      return "ok";
+    } catch (err) {
+      if (cancelled()) return "stop";
+      if (err instanceof ApiError && err.status === 401) {
+        setMe(null);
+        return "stop";
+      }
+      if (!quiet) setError(err instanceof Error ? err.message : "Could not load the sheets");
+      return "error";
+    } finally {
+      inFlight.current = false;
+    }
+  }
+
+  function merge(job: Job) {
+    version.current += 1;
+    setJobs((current) =>
+      current.some((item) => item.id === job.id)
+        ? current.map((item) => (item.id === job.id ? job : item))
+        : [job, ...current],
+    );
+  }
+
+  function open(id: string) {
+    openStamp.current += 1;
+    setSelectedId(id);
+  }
 
   useEffect(() => {
     api<Account>("/api/me")
@@ -39,15 +110,44 @@ export function App() {
       .finally(() => setReady(true));
   }, []);
 
+  // First list load after sign-in; asks again when its answer was thrown away.
   useEffect(() => {
     if (!me) {
       setJobs([]);
       return;
     }
-    api<Job[]>("/api/jobs")
-      .then(setJobs)
-      .catch((err: Error) => setError(err.message));
+    let cancelled = false;
+    void (async () => {
+      for (;;) {
+        while (inFlight.current && !cancelled) await sleep(100);
+        if (cancelled) return;
+        const result = await requestList(() => cancelled, false);
+        if (result !== "stale") return;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [me]);
+
+  // Poll while something is running: one request at a time, next one scheduled after the previous finished.
+  useEffect(() => {
+    if (!me || !anyRunning) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      if (!inFlight.current) {
+        const result = await requestList(() => cancelled, true);
+        if (result === "stop") return;
+      }
+      if (!cancelled) timer = setTimeout(tick, 1000);
+    };
+    timer = setTimeout(tick, 1000);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [me, anyRunning]);
 
   if (!ready) {
     return <p className="muted">Loading…</p>;
@@ -68,7 +168,8 @@ export function App() {
           onClick={() => {
             api("/api/logout", { method: "POST" }).finally(() => {
               setMe(null);
-              setSelected(null);
+              setSelectedId(null);
+              setError("");
             });
           }}
         >
@@ -77,10 +178,10 @@ export function App() {
       </header>
       {error ? <p className="error">{error}</p> : null}
       <Create
-        onCreated={(job) => {
-          setJobs((current) => [job, ...current]);
-          setSelected(job);
-          setError("");
+        getStamp={() => openStamp.current}
+        onCreated={(job, stamp) => {
+          merge(job);
+          if (stamp === openStamp.current) setSelectedId(job.id);
         }}
         onError={setError}
       />
@@ -89,7 +190,7 @@ export function App() {
           {jobs.length === 0 ? <li className="muted">No sheets yet.</li> : null}
           {jobs.map((job) => (
             <li key={job.id}>
-              <button className={selected?.id === job.id ? "row on" : "row"} onClick={() => setSelected(job)}>
+              <button className={selectedId === job.id ? "row on" : "row"} onClick={() => open(job.id)}>
                 <span>
                   <strong>{job.title}</strong>
                   <span className="muted">{job.address}</span>
@@ -100,14 +201,7 @@ export function App() {
           ))}
         </ul>
         {selected ? (
-          <Sheet
-            job={selected}
-            onChange={(job) => {
-              setSelected(job);
-              setJobs((current) => current.map((item) => (item.id === job.id ? job : item)));
-            }}
-            onError={setError}
-          />
+          <Sheet key={selected.id} job={selected} onChange={merge} onError={setError} />
         ) : (
           <p className="muted">Select a sheet.</p>
         )}
@@ -160,10 +254,28 @@ function Auth({ onIn }: { onIn: (account: Account) => void }) {
   );
 }
 
-function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError: (message: string) => void }) {
+function Create({
+  getStamp,
+  onCreated,
+  onError,
+}: {
+  getStamp: () => number;
+  onCreated: (job: Job, stamp: number) => void;
+  onError: (message: string) => void;
+}) {
   const [title, setTitle] = useState("");
   const [address, setAddress] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  const [fileKey, setFileKey] = useState(0);
+  // A second click while the two requests are on their way would create a second sheet.
+  const [busy, setBusy] = useState(false);
+
+  function reset() {
+    setTitle("");
+    setAddress("");
+    setFile(null);
+    setFileKey((key) => key + 1);
+  }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -171,21 +283,35 @@ function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError
       onError("Choose a brochure file");
       return;
     }
+    if (file.size > MAX_BROCHURE) {
+      onError(TOO_LARGE);
+      return;
+    }
+    const stamp = getStamp();
+    let created: Job | null = null;
+    setBusy(true);
     try {
-      const job = await api<Job>("/api/jobs", {
+      created = await api<Job>("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, address }),
       });
       const body = new FormData();
       body.append("file", file);
-      const saved = await api<Job>("/api/jobs/" + job.id + "/file", { method: "POST", body });
-      setTitle("");
-      setAddress("");
-      setFile(null);
-      onCreated(saved);
+      const saved = await api<Job>("/api/jobs/" + created.id + "/file", { method: "POST", body });
+      reset();
+      onError("");
+      onCreated(saved, stamp);
     } catch (err) {
-      onError(err instanceof Error ? err.message : "Could not create the sheet");
+      const message = err instanceof Error ? err.message : "Could not create the sheet";
+      if (created) {
+        // The draft exists on the server: show it, then the upload error.
+        reset();
+        onCreated(created, stamp);
+      }
+      onError(message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -202,13 +328,16 @@ function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError
       <label>
         Brochure
         <input
+          key={fileKey}
           type="file"
           accept=".pdf,.txt,application/pdf,text/plain"
           onChange={(event) => setFile(event.target.files?.[0] ?? null)}
           required
         />
       </label>
-      <button type="submit">Create sheet</button>
+      <button type="submit" disabled={busy}>
+        Create sheet
+      </button>
     </form>
   );
 }
@@ -222,13 +351,47 @@ function Sheet({
   onChange: (job: Job) => void;
   onError: (message: string) => void;
 }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [fileKey, setFileKey] = useState(0);
+  // A second upload of the same file would be answered with "already has a brochure".
+  const [busy, setBusy] = useState(false);
+
   async function start() {
-    onError("");
+    setBusy(true);
     try {
       const next = await api<Job>("/api/jobs/" + job.id + "/start", { method: "POST" });
       onChange(next);
+      onError("");
     } catch (err) {
       onError(err instanceof Error ? err.message : "Could not start the sheet");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function attach(event: FormEvent) {
+    event.preventDefault();
+    if (!file) {
+      onError("Choose a brochure file");
+      return;
+    }
+    if (file.size > MAX_BROCHURE) {
+      onError(TOO_LARGE);
+      return;
+    }
+    setBusy(true);
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      const saved = await api<Job>("/api/jobs/" + job.id + "/file", { method: "POST", body });
+      setFile(null);
+      setFileKey((key) => key + 1);
+      onChange(saved);
+      onError("");
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Could not attach the brochure");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -238,6 +401,7 @@ function Sheet({
       <p>{job.address}</p>
       <p className={"status " + job.status}>{job.status}</p>
       {job.filename ? <p className="muted">{job.filename}</p> : null}
+      {job.runId ? <p className="muted">Run {job.runId}</p> : null}
       {job.error ? <p className="error">{job.error}</p> : null}
       <ol>
         {job.checklist.map((step) => (
@@ -246,7 +410,25 @@ function Sheet({
           </li>
         ))}
       </ol>
-      {job.status === "draft" ? <button onClick={start}>Start</button> : null}
+      {job.status === "draft" && !job.filename ? (
+        <form onSubmit={attach}>
+          <input
+            key={fileKey}
+            type="file"
+            accept=".pdf,.txt,application/pdf,text/plain"
+            onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+            required
+          />
+          <button type="submit" disabled={busy}>
+            Attach brochure
+          </button>
+        </form>
+      ) : null}
+      {job.status === "draft" && job.filename ? (
+        <button onClick={start} disabled={busy}>
+          Start
+        </button>
+      ) : null}
     </article>
   );
 }

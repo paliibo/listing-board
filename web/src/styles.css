@@ -73,6 +73,11 @@ button.ghost, button.row {
   color: inherit;
 }
 
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 button.row {
   width: 100%;
   display: flex;
