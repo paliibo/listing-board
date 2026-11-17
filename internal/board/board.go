@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"path/filepath"
 	"time"
 )
 
@@ -12,6 +13,24 @@ var (
 	ErrNotFound  = errors.New("not found")
 	ErrDuplicate = errors.New("duplicate")
 )
+
+// Sheet statuses. The API moves a draft to running; only the worker moves a
+// running sheet on to success or failed.
+const (
+	StatusDraft   = "draft"
+	StatusRunning = "running"
+	StatusSuccess = "success"
+	StatusFailed  = "failed"
+)
+
+// Checklist step states.
+const (
+	StepPending = "pending"
+	StepDone    = "done"
+)
+
+// BrochureMissing is the error a sheet carries once its brochure cannot be read.
+const BrochureMissing = "Brochure is missing"
 
 type User struct {
 	ID           string
@@ -40,10 +59,17 @@ type Job struct {
 
 func NewChecklist() []Step {
 	return []Step{
-		{Label: "Reading the brochure", State: "pending"},
-		{Label: "Checking the address", State: "pending"},
-		{Label: "Publishing the sheet", State: "pending"},
+		{Label: "Reading the brochure", State: StepPending},
+		{Label: "Checking the address", State: StepPending},
+		{Label: "Publishing the sheet", State: StepPending},
 	}
+}
+
+// BrochurePath is where the bytes of a sheet's brochure live. The API writes
+// the file and the worker reads it, so both build the path here. The name the
+// client gave the file is never part of it.
+func BrochurePath(dataDir, userID, jobID string) string {
+	return filepath.Join(dataDir, userID, jobID, "body")
 }
 
 func NewID() string {
