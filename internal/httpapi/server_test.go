@@ -22,6 +22,10 @@ import (
 	"listingboard/internal/board"
 )
 
+// The README names this test, so it keeps its name. It used to describe a
+// handler that finished the sheet on its own; it now describes the spec:
+// start moves a draft to running, chooses its run id, and leaves every step
+// to the worker.
 func TestStartMarksTheJobSuccessful(t *testing.T) {
 	srv, _ := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
@@ -33,16 +37,270 @@ func TestStartMarksTheJobSuccessful(t *testing.T) {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 	got := decodeJob(t, res)
-	if got.Status != "success" {
-		t.Fatalf("status %s, want success", got.Status)
+	if got.Status != "running" {
+		t.Fatalf("status %s, want running", got.Status)
 	}
 	if got.RunID == "" {
 		t.Fatal("runId is empty")
 	}
-	for _, step := range got.Checklist {
-		if step.State != "done" {
-			t.Fatalf("step %q is %s", step.Label, step.State)
+	if got.Error != "" {
+		t.Fatalf("error %q, want none", got.Error)
+	}
+	labels := []string{"Reading the brochure", "Checking the address", "Publishing the sheet"}
+	if len(got.Checklist) != len(labels) {
+		t.Fatalf("%d steps, want %d", len(got.Checklist), len(labels))
+	}
+	for i, step := range got.Checklist {
+		if step.Label != labels[i] {
+			t.Fatalf("step %d is %q, want %q", i, step.Label, labels[i])
 		}
+		if step.State != "pending" {
+			t.Fatalf("step %q is %s, want pending", step.Label, step.State)
+		}
+	}
+
+	// The handler stored what it answered: the sheet is running, not finished.
+	saved := getSheet(t, srv, cookie, job.ID)
+	if saved.Status != "running" || saved.RunID != got.RunID {
+		t.Fatalf("stored sheet is %s with runId %q, want running with %q", saved.Status, saved.RunID, got.RunID)
+	}
+	for _, step := range saved.Checklist {
+		if step.State != "pending" {
+			t.Fatalf("stored step %q is %s, want pending", step.Label, step.State)
+		}
+	}
+}
+
+func TestStartingARunningSheetAgainKeepsItsRunID(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := readySheet(t, srv, cookie, "Market loft")
+	first := startOK(t, srv, cookie, job.ID)
+
+	res := startSheet(srv, cookie, job.ID)
+	if res.Code != http.StatusOK {
+		t.Fatalf("second start: status %d: %s", res.Code, res.Body.String())
+	}
+	again := decodeJob(t, res)
+	if again.Status != "running" || again.RunID != first.RunID {
+		t.Fatalf("second start answered %s with runId %q, want running with %q", again.Status, again.RunID, first.RunID)
+	}
+	saved := getSheet(t, srv, cookie, job.ID)
+	if saved.Status != "running" || saved.RunID != first.RunID {
+		t.Fatalf("stored sheet is %s with runId %q, want running with %q", saved.Status, saved.RunID, first.RunID)
+	}
+	for _, step := range append(again.Checklist, saved.Checklist...) {
+		if step.State != "pending" {
+			t.Fatalf("step %q is %s, want pending", step.Label, step.State)
+		}
+	}
+}
+
+func TestStartWithoutABrochureAsksForOne(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	res := startSheet(srv, cookie, job.ID)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := errorText(t, res); got != "Attach a brochure first" {
+		t.Fatalf("error %q, want %q", got, "Attach a brochure first")
+	}
+	saved := getSheet(t, srv, cookie, job.ID)
+	if saved.Status != "draft" || saved.RunID != "" {
+		t.Fatalf("stored sheet is %s with runId %q, want a draft without one", saved.Status, saved.RunID)
+	}
+}
+
+func TestASecondSheetCannotStartWhileOneIsRunning(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestServer(t)
+	ada := signUp(t, srv, "ada@example.com")
+	grace := signUp(t, srv, "grace@example.com")
+	first := readySheet(t, srv, ada, "Market loft")
+	second := readySheet(t, srv, ada, "Harbour flat")
+	theirs := readySheet(t, srv, grace, "Garden house")
+	running := startOK(t, srv, ada, first.ID)
+
+	res := startSheet(srv, ada, second.ID)
+	if res.Code != http.StatusConflict {
+		t.Fatalf("status %d, want 409: %s", res.Code, res.Body.String())
+	}
+	if got := errorText(t, res); got != "Another sheet is already running" {
+		t.Fatalf("error %q, want %q", got, "Another sheet is already running")
+	}
+	if saved := getSheet(t, srv, ada, second.ID); saved.Status != "draft" || saved.RunID != "" {
+		t.Fatalf("second sheet is %s with runId %q, want a draft without one", saved.Status, saved.RunID)
+	}
+	if saved := getSheet(t, srv, ada, first.ID); !sameRun(saved, running) {
+		t.Fatalf("first sheet changed: %+v, was %+v", saved, running)
+	}
+
+	// The limit is per account: another account starts its own sheet.
+	if other := startOK(t, srv, grace, theirs.ID); other.Status != "running" {
+		t.Fatalf("other account's sheet is %s, want running", other.Status)
+	}
+}
+
+func TestADraftWithoutABrochureAsksForOneEvenWhileAnotherRuns(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	first := readySheet(t, srv, cookie, "Market loft")
+	bare := createSheet(t, srv, cookie, "Harbour flat", "2 Harbour Road")
+	startOK(t, srv, cookie, first.ID)
+
+	res := startSheet(srv, cookie, bare.ID)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := errorText(t, res); got != "Attach a brochure first" {
+		t.Fatalf("error %q, want %q", got, "Attach a brochure first")
+	}
+}
+
+func TestStartLeavesFinishedSheetsAsTheyAre(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	cases := []struct {
+		status, error string
+		states        []string
+	}{
+		{"failed", "Brochure is missing", []string{"done", "pending", "pending"}},
+		{"success", "", []string{"done", "done", "done"}},
+	}
+	for _, c := range cases {
+		job := readySheet(t, srv, cookie, "Sheet "+c.status)
+		finished := setSheet(t, srv, job.ID, func(job *board.Job) {
+			job.Status = c.status
+			job.Error = c.error
+			job.RunID = board.NewID()
+			for i := range job.Checklist {
+				job.Checklist[i].State = c.states[i]
+			}
+		})
+
+		res := startSheet(srv, cookie, job.ID)
+		if res.Code != http.StatusOK {
+			t.Fatalf("%s sheet: status %d: %s", c.status, res.Code, res.Body.String())
+		}
+		if got := decodeJob(t, res); !sameRun(got, finished) {
+			t.Errorf("%s sheet: answered %+v, want %+v", c.status, got, finished)
+		}
+		if saved := getSheet(t, srv, cookie, job.ID); !sameRun(saved, finished) {
+			t.Errorf("%s sheet: stored %+v, want %+v", c.status, saved, finished)
+		}
+	}
+}
+
+func TestTheNextSheetStartsOnceTheRunningOneIsFinished(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	first := readySheet(t, srv, cookie, "Market loft")
+	second := readySheet(t, srv, cookie, "Harbour flat")
+	startOK(t, srv, cookie, first.ID)
+	if res := startSheet(srv, cookie, second.ID); res.Code != http.StatusConflict {
+		t.Fatalf("while the first runs: status %d, want 409", res.Code)
+	}
+
+	setSheet(t, srv, first.ID, func(job *board.Job) { job.Status = "success" })
+	if got := startOK(t, srv, cookie, second.ID); got.Status != "running" || got.RunID == "" {
+		t.Fatalf("second sheet is %s with runId %q, want running with one", got.Status, got.RunID)
+	}
+}
+
+func TestSimultaneousStartsOfOneDraftShareOneRunID(t *testing.T) {
+	t.Parallel()
+	srv, _ := newSlowServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := readySheet(t, srv, cookie, "Market loft")
+
+	const starts = 16
+	results := make([]*httptest.ResponseRecorder, starts)
+	var ready, wg sync.WaitGroup
+	gate := make(chan struct{})
+	for i := range results {
+		ready.Add(1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready.Done()
+			<-gate
+			results[i] = startSheet(srv, cookie, job.ID)
+		}()
+	}
+	ready.Wait()
+	close(gate)
+	wg.Wait()
+
+	runIDs := map[string]bool{}
+	for i, res := range results {
+		if res.Code != http.StatusOK {
+			t.Fatalf("start %d: status %d: %s", i, res.Code, res.Body.String())
+		}
+		got := decodeJob(t, res)
+		if got.Status != "running" {
+			t.Fatalf("start %d answered %s, want running", i, got.Status)
+		}
+		runIDs[got.RunID] = true
+	}
+	if len(runIDs) != 1 {
+		t.Fatalf("%d run ids for one sheet: %v", len(runIDs), runIDs)
+	}
+	saved := getSheet(t, srv, cookie, job.ID)
+	if !runIDs[saved.RunID] {
+		t.Fatalf("stored runId %q is not the one answered: %v", saved.RunID, runIDs)
+	}
+}
+
+func TestSimultaneousStartsOfTwoDraftsAdmitOne(t *testing.T) {
+	t.Parallel()
+	srv, _ := newSlowServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+
+	for round := range 20 {
+		ids := []string{
+			readySheet(t, srv, cookie, fmt.Sprintf("Loft %d", round)).ID,
+			readySheet(t, srv, cookie, fmt.Sprintf("Flat %d", round)).ID,
+		}
+		results := make([]*httptest.ResponseRecorder, len(ids))
+		var ready, wg sync.WaitGroup
+		gate := make(chan struct{})
+		for i, id := range ids {
+			ready.Add(1)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ready.Done()
+				<-gate
+				results[i] = startSheet(srv, cookie, id)
+			}()
+		}
+		ready.Wait()
+		close(gate)
+		wg.Wait()
+
+		codes := []int{results[0].Code, results[1].Code}
+		slices.Sort(codes)
+		if !slices.Equal(codes, []int{http.StatusOK, http.StatusConflict}) {
+			t.Fatalf("round %d: statuses %v, want one 200 and one 409", round, codes)
+		}
+		var running []string
+		for _, job := range listSheets(t, srv, cookie) {
+			if job.Status == "running" {
+				running = append(running, job.ID)
+			}
+		}
+		if len(running) != 1 {
+			t.Fatalf("round %d: %d sheets running, want 1", round, len(running))
+		}
+		setSheet(t, srv, running[0], func(job *board.Job) { job.Status = "success" })
 	}
 }
 
@@ -177,6 +435,31 @@ func newTestServer(t *testing.T) (*Server, string) {
 	return New(newMem(), dir, ""), dir
 }
 
+// newSlowServer is newTestServer on a store that pauses after every read.
+func newSlowServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	dir := t.TempDir()
+	return New(slowStore{newMem()}, dir, ""), dir
+}
+
+// slowStore pauses after every read. Two requests that decide on the same
+// read then always collide unless something keeps them apart, so a test for
+// simultaneous requests fails every time the guard is missing, not only when
+// the scheduler happens to interleave them.
+type slowStore struct{ board.Store }
+
+func (s slowStore) Job(ctx context.Context, id string) (board.Job, error) {
+	job, err := s.Store.Job(ctx, id)
+	time.Sleep(2 * time.Millisecond)
+	return job, err
+}
+
+func (s slowStore) ListJobs(ctx context.Context, userID string) ([]board.Job, error) {
+	jobs, err := s.Store.ListJobs(ctx, userID)
+	time.Sleep(2 * time.Millisecond)
+	return jobs, err
+}
+
 func signUp(t *testing.T, srv *Server, email string) string {
 	t.Helper()
 	body := strings.NewReader(`{"email":"` + email + `","password":"password123"}`)
@@ -239,6 +522,79 @@ func getSheet(t *testing.T, srv *Server, cookie, id string) board.Job {
 		t.Fatalf("get sheet %d: %s", res.Code, res.Body.String())
 	}
 	return decodeJob(t, res)
+}
+
+// readySheet creates a draft with a brochure attached, ready to start.
+func readySheet(t *testing.T, srv *Server, cookie, title string) board.Job {
+	t.Helper()
+	job := createSheet(t, srv, cookie, title, "10 Market Street")
+	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	return job
+}
+
+func startSheet(srv *Server, cookie, id string) *httptest.ResponseRecorder {
+	return call(srv, http.MethodPost, "/api/jobs/"+id+"/start", cookie, nil, "")
+}
+
+// startOK starts a sheet that must start and returns the answer.
+func startOK(t *testing.T, srv *Server, cookie, id string) board.Job {
+	t.Helper()
+	res := startSheet(srv, cookie, id)
+	if res.Code != http.StatusOK {
+		t.Fatalf("start %d: %s", res.Code, res.Body.String())
+	}
+	return decodeJob(t, res)
+}
+
+func listSheets(t *testing.T, srv *Server, cookie string) []board.Job {
+	t.Helper()
+	res := call(srv, http.MethodGet, "/api/jobs", cookie, nil, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("list %d: %s", res.Code, res.Body.String())
+	}
+	var jobs []board.Job
+	if err := json.Unmarshal(res.Body.Bytes(), &jobs); err != nil {
+		t.Fatal(err)
+	}
+	return jobs
+}
+
+// errorText returns the message of a JSON error body that holds nothing else.
+func errorText(t *testing.T, res *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body map[string]string
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("error body %q: %v", res.Body.String(), err)
+	}
+	if len(body) != 1 {
+		t.Fatalf("error body %q, want only an error", res.Body.String())
+	}
+	text, ok := body["error"]
+	if !ok {
+		t.Fatalf("error body %q has no error", res.Body.String())
+	}
+	return text
+}
+
+// setSheet changes a sheet behind the API's back, as the worker would, and
+// returns what it stored.
+func setSheet(t *testing.T, srv *Server, id string, change func(*board.Job)) board.Job {
+	t.Helper()
+	job, err := srv.store.Job(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change(&job)
+	if err := srv.store.UpdateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	return job
+}
+
+// sameRun reports whether two views of a sheet agree on its run.
+func sameRun(a, b board.Job) bool {
+	return a.ID == b.ID && a.Status == b.Status && a.Error == b.Error &&
+		a.RunID == b.RunID && slices.Equal(a.Checklist, b.Checklist)
 }
 
 // accountID asks the API who the session belongs to.
