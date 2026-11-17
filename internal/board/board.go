@@ -98,5 +98,9 @@ type Store interface {
 	ListJobs(ctx context.Context, userID string) ([]Job, error)
 	CreateJob(ctx context.Context, job Job) error
 	Job(ctx context.Context, id string) (Job, error)
+	// UpdateJob saves a sheet the API has changed. The API only changes
+	// drafts, so a store may answer ErrNotFound for a sheet that has left
+	// draft, as it does for one that is gone, and ErrDuplicate when the
+	// account already has a running sheet.
 	UpdateJob(ctx context.Context, job Job) error
 }

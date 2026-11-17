@@ -11,16 +11,15 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"listingboard/internal/board"
 )
 
 const (
-	maxBrochure     = 1 << 20
-	maxUploadBody   = 2 << 20 // the multipart envelope adds bytes to the file
-	maxFilenameSize = 255
+	maxBrochure      = 1 << 20
+	maxUploadBody    = 2 << 20 // the multipart envelope adds bytes to the file
+	maxFilenameRunes = 255     // the longest name the common file systems allow
 )
 
 var pdfMagic = []byte("%PDF-")
@@ -71,8 +70,12 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 			part, name = p, filename
 		}
 	}
-	if !validFilename(name) {
+	if strings.TrimSpace(name) == "" {
 		writeErr(w, http.StatusBadRequest, "Choose a brochure file")
+		return
+	}
+	if !storableFilename(name) {
+		writeErr(w, http.StatusBadRequest, "Brochure file name is not valid")
 		return
 	}
 
@@ -115,7 +118,13 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	job.Filename = name
 	job.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpdateJob(r.Context(), job); err != nil {
-		removeBrochure(path, created)
+		// Take the file away only when the sheet is known to have no brochure.
+		// An error can also mean that the answer was lost after the row was
+		// written; the row then names this file, and removing it would leave
+		// a sheet that can only fail.
+		if saved, loadErr := s.store.Job(r.Context(), job.ID); loadErr == nil && saved.Filename == "" {
+			removeBrochure(path, created)
+		}
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
@@ -173,13 +182,14 @@ func notAttachable(job board.Job) string {
 	return ""
 }
 
-// validFilename accepts what a TEXT column can hold; Postgres rejects NUL and
-// invalid UTF-8, which would otherwise surface as a 500.
-func validFilename(name string) bool {
-	if strings.TrimSpace(name) == "" || len(name) > maxFilenameSize || !utf8.ValidString(name) {
-		return false
-	}
-	return !strings.ContainsFunc(name, unicode.IsControl)
+// storableFilename reports whether the client's name can be kept as it is.
+// Postgres refuses NUL and invalid UTF-8 in a TEXT column, which would
+// otherwise surface as a 500. The length cap counts characters, not bytes,
+// so it turns away no name a real file can have; like the caps on title and
+// address it keeps one sheet from growing the list without bound.
+func storableFilename(name string) bool {
+	return utf8.ValidString(name) && !strings.ContainsRune(name, 0) &&
+		utf8.RuneCountInString(name) <= maxFilenameRunes
 }
 
 func isPDF(data []byte) bool {

@@ -9,8 +9,10 @@ import (
 //
 // Attaching a brochure and starting a sheet both read a sheet, decide, and
 // write it back, and "one running sheet per account" spans several sheets.
-// Holding the account's lock around that sequence keeps two requests from
-// deciding on the same stale read, whatever store is behind the API.
+// Holding the account's lock around that sequence keeps two requests of this
+// process from deciding on the same stale read, even with a store that only
+// offers plain reads and writes. Between processes the store decides: see
+// UpdateJob in internal/store.
 //
 // The mutex is picked by a hash of the account id from a fixed set, so there
 // is nothing to clean up; two accounts that share one only wait for each other.

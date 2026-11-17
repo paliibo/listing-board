@@ -42,7 +42,7 @@ func TestStatusAndStepTextsMatchTheReadme(t *testing.T) {
 
 func TestBrochurePathIsUserThenSheetThenBody(t *testing.T) {
 	got := BrochurePath("/data", "user1", "sheet1")
-	want := filepath.Join("/data", "user1", "sheet1", "body")
+	want := filepath.FromSlash("/data/user1/sheet1/body")
 	if got != want {
 		t.Fatalf("path %q, want %q", got, want)
 	}

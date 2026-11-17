@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -305,6 +306,67 @@ func TestSimultaneousStartsOfTwoDraftsAdmitOne(t *testing.T) {
 	}
 }
 
+// With Postgres a second API process can touch the account between this
+// request's read and its write; the store then answers the write with
+// ErrNotFound or ErrDuplicate. raceStore plays that other process.
+func TestStartAnswersFromTheSheetAnotherProcessStarted(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	store := newMem()
+	srv := New(store, dir, "")
+	cookie := signUp(t, srv, "ada@example.com")
+	job := readySheet(t, srv, cookie, "Market loft")
+
+	theirRun := board.NewID()
+	racing := New(raceStore{Store: store, onUpdate: func(ctx context.Context, _ board.Job) error {
+		// The other process starts the sheet first, so our write finds no draft.
+		theirs, err := store.Job(ctx, job.ID)
+		if err != nil {
+			return err
+		}
+		theirs.Status = "running"
+		theirs.RunID = theirRun
+		if err := store.UpdateJob(ctx, theirs); err != nil {
+			return err
+		}
+		return board.ErrNotFound
+	}}, dir, "")
+
+	res := startSheet(racing, cookie, job.ID)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	if got := decodeJob(t, res); got.Status != "running" || got.RunID != theirRun {
+		t.Fatalf("answered %s with runId %q, want running with the run id already chosen, %q", got.Status, got.RunID, theirRun)
+	}
+	if saved := getSheet(t, srv, cookie, job.ID); saved.RunID != theirRun {
+		t.Fatalf("stored runId %q, want %q", saved.RunID, theirRun)
+	}
+}
+
+func TestStartIsAConflictWhenTheStoreFindsAnotherRunningSheet(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	store := newMem()
+	srv := New(store, dir, "")
+	cookie := signUp(t, srv, "ada@example.com")
+	job := readySheet(t, srv, cookie, "Market loft")
+	racing := New(raceStore{Store: store, onUpdate: func(context.Context, board.Job) error {
+		return board.ErrDuplicate
+	}}, dir, "")
+
+	res := startSheet(racing, cookie, job.ID)
+	if res.Code != http.StatusConflict {
+		t.Fatalf("status %d, want 409: %s", res.Code, res.Body.String())
+	}
+	if got := errorText(t, res); got != "Another sheet is already running" {
+		t.Fatalf("error %q, want %q", got, "Another sheet is already running")
+	}
+	if saved := getSheet(t, srv, cookie, job.ID); saved.Status != "draft" || saved.RunID != "" {
+		t.Fatalf("stored sheet is %s with runId %q, want a draft without one", saved.Status, saved.RunID)
+	}
+}
+
 func TestUploadKeepsTheClientFilename(t *testing.T) {
 	srv, dir := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
@@ -525,14 +587,14 @@ func TestUploadNeedsAFileWithAUsableName(t *testing.T) {
 	cases := []struct {
 		name     string
 		filename string
-		ok       bool
+		refusal  string // "" when the name is accepted
 	}{
-		{"only spaces", "   ", false},
-		{"256 bytes", strings.Repeat("a", 252) + ".txt", false},
-		{"a tab", "bro\tchure.txt", false},
-		{"a C1 control character", "bro\u0085chure.txt", false},
-		{"255 bytes", strings.Repeat("a", 251) + ".txt", true},
-		{"non-ASCII", "план будинку.pdf", true},
+		{"only spaces", "   ", "Choose a brochure file"},
+		{"256 characters", strings.Repeat("я", 252) + ".txt", "Brochure file name is not valid"},
+		{"invalid UTF-8", "bro\xffchure.txt", "Brochure file name is not valid"},
+		{"255 characters, 506 bytes", strings.Repeat("я", 251) + ".txt", ""},
+		{"non-ASCII", "план будинку.pdf", ""},
+		{"a tab", "bro\tchure.txt", ""},
 	}
 	for _, c := range cases {
 		srv, dir := newTestServer(t)
@@ -540,7 +602,7 @@ func TestUploadNeedsAFileWithAUsableName(t *testing.T) {
 		job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
 
 		res := postFile(t, srv, cookie, job.ID, c.filename, []byte("%PDF-1.4\n"), "application/pdf")
-		if c.ok {
+		if c.refusal == "" {
 			if res.Code != http.StatusOK {
 				t.Errorf("%s: status %d: %s", c.name, res.Code, res.Body.String())
 			} else if got := getSheet(t, srv, cookie, job.ID).Filename; got != c.filename {
@@ -552,8 +614,8 @@ func TestUploadNeedsAFileWithAUsableName(t *testing.T) {
 			t.Errorf("%s: status %d, want 400: %s", c.name, res.Code, res.Body.String())
 			continue
 		}
-		if got := errorText(t, res); got != "Choose a brochure file" {
-			t.Errorf("%s: error %q, want %q", c.name, got, "Choose a brochure file")
+		if got := errorText(t, res); got != c.refusal {
+			t.Errorf("%s: error %q, want %q", c.name, got, c.refusal)
 		}
 		assertNothingAttached(t, srv, cookie, job.ID, dir)
 	}
@@ -650,6 +712,36 @@ func TestAnUploadThatCannotBeSavedLeavesNoFile(t *testing.T) {
 		t.Fatalf("status %d, want 500: %s", res.Code, res.Body.String())
 	}
 	assertNothingAttached(t, srv, cookie, job.ID, dir)
+}
+
+func TestAnUploadWhoseAnswerWasLostKeepsItsFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	store := newMem()
+	srv := New(store, dir, "")
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	// The row is written, and then the connection drops before the answer.
+	lossy := New(raceStore{Store: store, onUpdate: func(ctx context.Context, job board.Job) error {
+		if err := store.UpdateJob(ctx, job); err != nil {
+			return err
+		}
+		return errors.New("connection lost")
+	}}, dir, "")
+	brochure := []byte("%PDF-1.4\n")
+
+	res := postFile(t, lossy, cookie, job.ID, "brochure.pdf", brochure, "application/pdf")
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500: %s", res.Code, res.Body.String())
+	}
+	// The sheet names the file, so the file must still be there.
+	if got := getSheet(t, srv, cookie, job.ID).Filename; got != "brochure.pdf" {
+		t.Fatalf("filename %q, want brochure.pdf", got)
+	}
+	down := call(srv, http.MethodGet, "/api/jobs/"+job.ID+"/file", cookie, nil, "")
+	if down.Code != http.StatusOK || !bytes.Equal(down.Body.Bytes(), brochure) {
+		t.Fatalf("download: status %d, body %q", down.Code, down.Body.String())
+	}
 }
 
 func TestAnUploadRequestHasALimitOfItsOwn(t *testing.T) {
@@ -767,6 +859,104 @@ func assertNothingAttached(t *testing.T, srv *Server, cookie, id, dir string) {
 	}
 }
 
+func TestASheetHasTheFieldsTheReadmeShows(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	body := strings.NewReader(`{"title":"Market loft","address":"10 Market Street"}`)
+	res := call(srv, http.MethodPost, "/api/jobs", cookie, body, "application/json")
+	if res.Code != http.StatusCreated {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	var sheet map[string]json.RawMessage
+	if err := json.Unmarshal(res.Body.Bytes(), &sheet); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"title":    `"Market loft"`,
+		"address":  `"10 Market Street"`,
+		"status":   `"draft"`,
+		"error":    `""`,
+		"runId":    `""`,
+		"filename": `""`,
+		"checklist": `[{"label":"Reading the brochure","state":"pending"},` +
+			`{"label":"Checking the address","state":"pending"},` +
+			`{"label":"Publishing the sheet","state":"pending"}]`,
+	}
+	for field, value := range want {
+		if got := string(sheet[field]); got != value {
+			t.Errorf("%s is %s, want %s", field, got, value)
+		}
+	}
+	var id string
+	if err := json.Unmarshal(sheet["id"], &id); err != nil || id == "" {
+		t.Errorf("id is %s, want a non-empty string", sheet["id"])
+	}
+	var created time.Time
+	if err := json.Unmarshal(sheet["createdAt"], &created); err != nil || created.IsZero() {
+		t.Errorf("createdAt is %s, want a time", sheet["createdAt"])
+	}
+}
+
+func TestAccountRoutesAnswerAsTheReadmeSays(t *testing.T) {
+	t.Parallel()
+	srv, _ := newTestServer(t)
+
+	health := call(srv, http.MethodGet, "/api/health", "", nil, "")
+	if health.Code != http.StatusOK || health.Body.String() != "ok" {
+		t.Errorf("health: status %d, body %q, want 200 and ok", health.Code, health.Body.String())
+	}
+
+	credentials := `{"email":"ada@example.com","password":"password123"}`
+	account := func(res *httptest.ResponseRecorder) map[string]string {
+		t.Helper()
+		var body map[string]string
+		if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+			t.Fatalf("body %q: %v", res.Body.String(), err)
+		}
+		if len(body) != 2 || body["id"] == "" || body["email"] != "ada@example.com" {
+			t.Fatalf("body %q, want {id, email}", res.Body.String())
+		}
+		return body
+	}
+	session := func(res *httptest.ResponseRecorder) string {
+		t.Helper()
+		for _, cookie := range res.Result().Cookies() {
+			if cookie.Name == "lb_session" {
+				return cookie.Value
+			}
+		}
+		t.Fatal("no lb_session cookie")
+		return ""
+	}
+
+	registered := call(srv, http.MethodPost, "/api/register", "", strings.NewReader(credentials), "application/json")
+	if registered.Code != http.StatusCreated {
+		t.Fatalf("register: status %d, want 201: %s", registered.Code, registered.Body.String())
+	}
+	id := account(registered)["id"]
+	session(registered)
+
+	login := call(srv, http.MethodPost, "/api/login", "", strings.NewReader(credentials), "application/json")
+	if login.Code != http.StatusOK || account(login)["id"] != id {
+		t.Fatalf("login: status %d, body %s, want 200 and the same account", login.Code, login.Body.String())
+	}
+	cookie := session(login)
+
+	me := call(srv, http.MethodGet, "/api/me", cookie, nil, "")
+	if me.Code != http.StatusOK || account(me)["id"] != id {
+		t.Fatalf("me: status %d, body %s, want 200 and the same account", me.Code, me.Body.String())
+	}
+
+	if logout := call(srv, http.MethodPost, "/api/logout", cookie, nil, ""); logout.Code != http.StatusOK {
+		t.Fatalf("logout: status %d, want 200", logout.Code)
+	}
+	after := call(srv, http.MethodGet, "/api/me", cookie, nil, "")
+	if after.Code != http.StatusUnauthorized || errorText(t, after) == "" {
+		t.Fatalf("me after logout: status %d, body %s, want 401 with an error", after.Code, after.Body.String())
+	}
+}
+
 func TestListHidesOtherUsersJobs(t *testing.T) {
 	srv, _ := newTestServer(t)
 	ada := signUp(t, srv, "ada@example.com")
@@ -857,8 +1047,9 @@ func TestSheetsOfAnotherAccountAreNotFound(t *testing.T) {
 func TestAccountLocksAdmitOneRequestPerAccount(t *testing.T) {
 	t.Parallel()
 	var locks accountLocks
-	const requests = 64
-	inside, visits := 0, 0
+	const requests = 16
+	var inside atomic.Int32
+	visits := 0
 	var wg sync.WaitGroup
 	for range requests {
 		wg.Add(1)
@@ -866,12 +1057,13 @@ func TestAccountLocksAdmitOneRequestPerAccount(t *testing.T) {
 			defer wg.Done()
 			unlock := locks.lock("ada")
 			defer unlock()
-			inside++
-			if inside != 1 {
-				t.Errorf("%d requests hold the account's lock at once", inside)
+			// Stay inside for a moment: without exclusion the others arrive now.
+			if n := inside.Add(1); n != 1 {
+				t.Errorf("%d requests hold the account's lock at once", n)
 			}
+			time.Sleep(time.Millisecond)
 			visits++
-			inside--
+			inside.Add(-1)
 		}()
 	}
 	wg.Wait()
@@ -909,6 +1101,17 @@ func (s slowStore) ListJobs(ctx context.Context, userID string) ([]board.Job, er
 	jobs, err := s.Store.ListJobs(ctx, userID)
 	time.Sleep(2 * time.Millisecond)
 	return jobs, err
+}
+
+// raceStore answers UpdateJob with whatever the test decides, like a database
+// that another process is using at the same moment.
+type raceStore struct {
+	board.Store
+	onUpdate func(ctx context.Context, job board.Job) error
+}
+
+func (s raceStore) UpdateJob(ctx context.Context, job board.Job) error {
+	return s.onUpdate(ctx, job)
 }
 
 // brokenStore refuses every update, like a database that has gone away.
