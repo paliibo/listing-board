@@ -284,9 +284,36 @@ button.ghost {
   border-radius: var(--radius);
 }
 
+/* Stays in view while the page scrolls: on a phone the button that failed can be far below. */
 .banner {
+  position: sticky;
+  inset-block-start: 12px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin-block-end: 20px;
   border: 1px solid currentColor;
+}
+
+.banner button {
+  flex: none;
+  min-block-size: 32px;
+  padding: 4px 10px;
+  font-size: 0.8125rem;
+  color: inherit;
+  border-color: currentColor;
+}
+
+/* For a screen reader only. */
+.visually-hidden {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 /* The list of sheets */
@@ -547,6 +574,7 @@ button.row.on {
 /* A finger needs a larger target than a pointer. */
 @media (pointer: coarse) {
   button,
+  .banner button,
   input,
   .steps li {
     min-block-size: 44px;

@@ -58,12 +58,28 @@ function doneSteps(job: Job) {
   return job.checklist.filter((step) => step.state === "done").length;
 }
 
+// One sentence about a sheet as it is now, for a reader who cannot see the checklist move.
+function describe(job: Job) {
+  const done = job.checklist.filter((step) => step.state === "done");
+  if (job.status === "failed") return job.title + ": failed. " + job.error;
+  if (job.status === "running" && done.length > 0) {
+    return (
+      job.title + ": " + done[done.length - 1].label + " is done, " + done.length + " of " + job.checklist.length
+    );
+  }
+  return job.title + ": " + job.status;
+}
+
 export function App() {
   const [me, setMe] = useState<Account | null>(null);
   const [ready, setReady] = useState(false);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState("");
+  // What a screen reader is told; the text lives in one polite live region.
+  const [notice, setNotice] = useState("");
+  // The open sheet as it was last seen: its id, status and number of steps done.
+  const seen = useRef("");
   // Bumped by every local change to the list; a list answer requested before a bump is stale.
   const version = useRef(0);
   // Bumped whenever the user opens a sheet; Create compares it to decide whether to open the new sheet.
@@ -73,6 +89,7 @@ export function App() {
 
   const selected = jobs.find((job) => job.id === selectedId) ?? null;
   const anyRunning = jobs.some((job) => job.status === "running");
+  const state = selected ? selected.id + " " + selected.status + " " + doneSteps(selected) : "";
 
   async function requestList(cancelled: () => boolean, quiet: boolean): Promise<"ok" | "stale" | "stop" | "error"> {
     inFlight.current = true;
@@ -159,6 +176,16 @@ export function App() {
     };
   }, [me, anyRunning]);
 
+  // The checklist moves without the reader doing anything, so a change on the open sheet is
+  // announced. Opening a sheet is not a change, and neither is the first list after sign-in.
+  useEffect(() => {
+    const before = seen.current;
+    seen.current = state;
+    if (selected && before !== state && before.startsWith(selected.id + " ")) {
+      setNotice(describe(selected));
+    }
+  }, [state]);
+
   if (!ready) {
     return <p className="muted loading">Loading…</p>;
   }
@@ -176,12 +203,14 @@ export function App() {
         <div className="account">
           <span className="muted">{me.email}</span>
           <button
+            type="button"
             className="ghost"
             onClick={() => {
               api("/api/logout", { method: "POST" }).finally(() => {
                 setMe(null);
                 setSelectedId(null);
                 setError("");
+                setNotice("");
               });
             }}
           >
@@ -189,7 +218,17 @@ export function App() {
           </button>
         </div>
       </header>
-      {error ? <p className="error banner">{error}</p> : null}
+      <p className="visually-hidden" role="status">
+        {notice}
+      </p>
+      {error ? (
+        <div className="error banner">
+          <span role="alert">{error}</span>
+          <button type="button" className="ghost" onClick={() => setError("")}>
+            Dismiss
+          </button>
+        </div>
+      ) : null}
       <section className="panel" aria-labelledby="new-sheet">
         <h2 className="label" id="new-sheet">
           New sheet
@@ -212,7 +251,12 @@ export function App() {
             {jobs.length === 0 ? <li className="muted">No sheets yet.</li> : null}
             {jobs.map((job) => (
               <li key={job.id}>
-                <button className={selectedId === job.id ? "row on" : "row"} onClick={() => open(job.id)}>
+                <button
+                  type="button"
+                  className={selectedId === job.id ? "row on" : "row"}
+                  aria-current={selectedId === job.id ? "true" : undefined}
+                  onClick={() => open(job.id)}
+                >
                   <span className="row-main">
                     <strong>{job.title}</strong>
                     <span className="muted">{job.address}</span>
@@ -270,16 +314,36 @@ function Auth({ onIn }: { onIn: (account: Account) => void }) {
       <form className="panel" onSubmit={submit}>
         <label>
           Email
-          <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" required />
+          <input
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+            type="email"
+            name="email"
+            autoComplete="username"
+            autoCapitalize="none"
+            spellCheck={false}
+            required
+          />
         </label>
         <label>
           Password
-          <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" required />
+          <input
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            type="password"
+            name="password"
+            autoComplete={mode === "login" ? "current-password" : "new-password"}
+            required
+          />
         </label>
-        {error ? <p className="error">{error}</p> : null}
+        {error ? (
+          <p className="error" role="alert">
+            {error}
+          </p>
+        ) : null}
         <button type="submit">{mode === "login" ? "Sign in" : "Create account"}</button>
       </form>
-      <button className="ghost" onClick={() => setMode(mode === "login" ? "register" : "login")}>
+      <button type="button" className="ghost" onClick={() => setMode(mode === "login" ? "register" : "login")}>
         {mode === "login" ? "Need an account?" : "Already have an account?"}
       </button>
     </main>
@@ -454,6 +518,7 @@ function Sheet({
           {job.checklist.map((step, index) => (
             <li key={step.label} className={step.state} aria-current={index === current ? "step" : undefined}>
               {step.label}
+              <span className="visually-hidden">, {step.state}</span>
             </li>
           ))}
         </ol>
@@ -497,7 +562,7 @@ function Sheet({
         </form>
       ) : null}
       {job.status === "draft" && job.filename ? (
-        <button onClick={start} disabled={busy}>
+        <button type="button" onClick={start} disabled={busy}>
           Start
         </button>
       ) : null}
