@@ -54,6 +54,10 @@ function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+function doneSteps(job: Job) {
+  return job.checklist.filter((step) => step.state === "done").length;
+}
+
 export function App() {
   const [me, setMe] = useState<Account | null>(null);
   const [ready, setReady] = useState(false);
@@ -156,7 +160,7 @@ export function App() {
   }, [me, anyRunning]);
 
   if (!ready) {
-    return <p className="muted">Loading…</p>;
+    return <p className="muted loading">Loading…</p>;
   }
   if (!me) {
     return <Auth onIn={setMe} />;
@@ -164,54 +168,74 @@ export function App() {
 
   return (
     <main>
-      <header>
+      <header className="top">
         <div>
           <p className="eyebrow">Real estate</p>
           <h1>Listing board</h1>
         </div>
-        <button
-          className="ghost"
-          onClick={() => {
-            api("/api/logout", { method: "POST" }).finally(() => {
-              setMe(null);
-              setSelectedId(null);
-              setError("");
-            });
-          }}
-        >
-          Log out
-        </button>
+        <div className="account">
+          <span className="muted">{me.email}</span>
+          <button
+            className="ghost"
+            onClick={() => {
+              api("/api/logout", { method: "POST" }).finally(() => {
+                setMe(null);
+                setSelectedId(null);
+                setError("");
+              });
+            }}
+          >
+            Log out
+          </button>
+        </div>
       </header>
-      {error ? <p className="error">{error}</p> : null}
-      <Create
-        getStamp={() => openStamp.current}
-        onCreated={(job, stamp) => {
-          merge(job);
-          if (stamp === openStamp.current) setSelectedId(job.id);
-        }}
-        onError={setError}
-      />
-      <section className="layout">
-        <ul className="list">
-          {jobs.length === 0 ? <li className="muted">No sheets yet.</li> : null}
-          {jobs.map((job) => (
-            <li key={job.id}>
-              <button className={selectedId === job.id ? "row on" : "row"} onClick={() => open(job.id)}>
-                <span>
-                  <strong>{job.title}</strong>
-                  <span className="muted">{job.address}</span>
-                </span>
-                <span className={"status " + job.status}>{job.status}</span>
-              </button>
-            </li>
-          ))}
-        </ul>
+      {error ? <p className="error banner">{error}</p> : null}
+      <section className="panel" aria-labelledby="new-sheet">
+        <h2 className="label" id="new-sheet">
+          New sheet
+        </h2>
+        <Create
+          getStamp={() => openStamp.current}
+          onCreated={(job, stamp) => {
+            merge(job);
+            if (stamp === openStamp.current) setSelectedId(job.id);
+          }}
+          onError={setError}
+        />
+      </section>
+      <div className="layout">
+        <section className="sheets" aria-labelledby="sheets">
+          <h2 className="label" id="sheets">
+            Sheets
+          </h2>
+          <ul className="list">
+            {jobs.length === 0 ? <li className="muted">No sheets yet.</li> : null}
+            {jobs.map((job) => (
+              <li key={job.id}>
+                <button className={selectedId === job.id ? "row on" : "row"} onClick={() => open(job.id)}>
+                  <span className="row-main">
+                    <strong>{job.title}</strong>
+                    <span className="muted">{job.address}</span>
+                  </span>
+                  <span className="row-side">
+                    {job.status === "running" ? (
+                      <span className="count">
+                        {doneSteps(job)}/{job.checklist.length}
+                      </span>
+                    ) : null}
+                    <span className={"status " + job.status}>{job.status}</span>
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
         {selected ? (
           <Sheet key={selected.id} job={selected} onChange={merge} onError={setError} />
         ) : (
-          <p className="muted">Select a sheet.</p>
+          <p className="muted empty">Select a sheet.</p>
         )}
-      </section>
+      </div>
     </main>
   );
 }
@@ -239,9 +263,11 @@ function Auth({ onIn }: { onIn: (account: Account) => void }) {
 
   return (
     <main className="narrow">
-      <p className="eyebrow">Real estate</p>
-      <h1>Listing board</h1>
-      <form onSubmit={submit}>
+      <div>
+        <p className="eyebrow">Real estate</p>
+        <h1>Listing board</h1>
+      </div>
+      <form className="panel" onSubmit={submit}>
         <label>
           Email
           <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" required />
@@ -332,7 +358,9 @@ function Create({
         <input value={address} onChange={(event) => setAddress(event.target.value)} required />
       </label>
       <label>
-        Brochure
+        <span>
+          Brochure <span className="hint">PDF or plain text, up to 1 MiB</span>
+        </span>
         <input
           key={fileKey}
           type="file"
@@ -400,29 +428,69 @@ function Sheet({
     }
   }
 
+  // The step the worker is on: the first one not done yet, while the sheet runs.
+  const current = job.status === "running" ? job.checklist.findIndex((step) => step.state !== "done") : -1;
+
   return (
     <article className="sheet">
-      <h2>{job.title}</h2>
-      <p>{job.address}</p>
-      <p className={"status " + job.status}>{job.status}</p>
-      {job.filename ? <p className="muted">{job.filename}</p> : null}
-      {job.runId ? <p className="muted">Run {job.runId}</p> : null}
+      <header className="sheet-head">
+        <div>
+          <h2>{job.title}</h2>
+          <p className="muted">{job.address}</p>
+        </div>
+        <p className={"status " + job.status}>{job.status}</p>
+      </header>
       {job.error ? <p className="error">{job.error}</p> : null}
-      <ol>
-        {job.checklist.map((step) => (
-          <li key={step.label} className={step.state}>
-            {step.label}
-          </li>
-        ))}
-      </ol>
+      <div className="checklist">
+        <p className="label">
+          Checklist
+          {job.status === "draft" ? null : (
+            <span className="count">
+              {doneSteps(job)} of {job.checklist.length}
+            </span>
+          )}
+        </p>
+        <ol className="steps">
+          {job.checklist.map((step, index) => (
+            <li key={step.label} className={step.state} aria-current={index === current ? "step" : undefined}>
+              {step.label}
+            </li>
+          ))}
+        </ol>
+      </div>
+      {job.filename || job.runId ? (
+        <dl className="meta">
+          {job.filename ? (
+            <>
+              <dt>Brochure</dt>
+              <dd>
+                <a href={"/api/jobs/" + job.id + "/file"}>{job.filename}</a>
+              </dd>
+            </>
+          ) : null}
+          {job.runId ? (
+            <>
+              <dt>Run</dt>
+              <dd>
+                <code>{job.runId}</code>
+              </dd>
+            </>
+          ) : null}
+        </dl>
+      ) : null}
       {job.status === "draft" && !job.filename ? (
         <form onSubmit={attach}>
-          <input
-            key={fileKey}
-            type="file"
-            onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-            required
-          />
+          <label>
+            <span>
+              Brochure <span className="hint">PDF or plain text, up to 1 MiB</span>
+            </span>
+            <input
+              key={fileKey}
+              type="file"
+              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+              required
+            />
+          </label>
           <button type="submit" disabled={busy}>
             Attach brochure
           </button>

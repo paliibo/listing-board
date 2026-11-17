@@ -1,7 +1,31 @@
+/*
+ * One accent hue, and neutrals tinted towards it. Every colour is a pair, light
+ * then dark, and the browser picks by the reader's scheme.
+ */
 :root {
-  color: #1c1915;
-  background: #f4f1ea;
-  font-family: Palatino, "Iowan Old Style", Georgia, serif;
+  color-scheme: light dark;
+  --ground: light-dark(oklch(97.5% 0.004 250), oklch(17% 0.012 250));
+  --surface: light-dark(oklch(100% 0 0), oklch(21.5% 0.014 250));
+  --ink: light-dark(oklch(24% 0.02 250), oklch(93% 0.008 250));
+  --muted: light-dark(oklch(47% 0.02 250), oklch(72% 0.015 250));
+  --rule: light-dark(oklch(89% 0.008 250), oklch(31% 0.016 250));
+  --edge: light-dark(oklch(60% 0.015 250), oklch(58% 0.02 250));
+  --accent: light-dark(oklch(45% 0.13 250), oklch(76% 0.1 250));
+  --on-accent: light-dark(oklch(99% 0 0), oklch(18% 0.02 250));
+  --success: light-dark(oklch(45% 0.1 150), oklch(76% 0.13 150));
+  --danger: light-dark(oklch(48% 0.16 28), oklch(76% 0.12 28));
+  --danger-ground: light-dark(oklch(96% 0.02 28), oklch(25% 0.045 28));
+  --radius: 6px;
+  --sans: system-ui, sans-serif;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  color: var(--ink);
+  background: var(--ground);
+  font-family: var(--sans);
+  line-height: 1.45;
+  accent-color: var(--accent);
+  scrollbar-gutter: stable;
 }
 
 body {
@@ -9,126 +33,548 @@ body {
 }
 
 main {
-  max-width: 960px;
-  margin: 0 auto;
-  padding: 32px 20px 64px;
+  max-inline-size: 1040px;
+  margin-inline: auto;
+  padding: 28px 20px 64px;
 }
 
-h1, h2 {
+h1,
+h2 {
+  margin: 0;
+  font-family: var(--serif);
   font-weight: 600;
-  margin: 0 0 8px;
+  text-wrap: balance;
+  overflow-wrap: anywhere;
 }
 
-header, .create, .layout, form {
-  display: grid;
-  gap: 16px;
+h1 {
+  font-size: 1.75rem;
+  line-height: 1.15;
 }
 
-header {
-  grid-template-columns: 1fr auto;
-  align-items: end;
-  margin-bottom: 24px;
+h2 {
+  font-size: 1.375rem;
+  line-height: 1.2;
 }
 
-.layout {
-  grid-template-columns: 280px 1fr;
-  margin-top: 28px;
+p {
+  margin: 0;
 }
 
-.narrow {
-  max-width: 420px;
+a {
+  color: var(--accent);
+  text-underline-offset: 2px;
 }
 
-.eyebrow {
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Small capitals over a block: the page name's eyebrow and the section names. */
+.eyebrow,
+.label {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.45;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  font-size: 12px;
-  margin: 0 0 8px;
+  color: var(--muted);
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.count {
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.loading {
+  padding: 32px 20px;
+}
+
+/* Header */
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px 24px;
+  margin-block-end: 24px;
+  padding-block-end: 20px;
+  border-block-end: 1px solid var(--rule);
+}
+
+.account {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-inline-size: 0;
+}
+
+.account .muted {
+  overflow-wrap: anywhere;
+}
+
+/* Forms and buttons */
+
+form {
+  display: grid;
+  gap: 14px;
 }
 
 label {
   display: grid;
   gap: 6px;
-  font-size: 14px;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.hint {
+  color: var(--muted);
+  font-weight: 400;
 }
 
 input {
-  font: inherit;
+  box-sizing: border-box;
+  inline-size: 100%;
+  min-block-size: 40px;
   padding: 8px 10px;
-  border: 1px solid #d9d2c5;
-  background: #fff;
+  font: inherit;
+  /* Below 16px a phone zooms the page when the field takes focus. */
+  font-size: max(1rem, 16px);
+  font-weight: 400;
+  color: inherit;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
 }
 
-button {
+input[type="file"] {
+  padding: 5px;
+  font-size: 0.875rem;
+}
+
+input::file-selector-button {
+  margin-inline-end: 10px;
+  padding: 4px 10px;
   font: inherit;
-  padding: 8px 14px;
-  border: 1px solid #1c1915;
-  background: #1c1915;
-  color: #f4f1ea;
+  color: inherit;
+  background: var(--ground);
+  border: 1px solid var(--edge);
+  border-radius: calc(var(--radius) - 2px);
   cursor: pointer;
 }
 
-button.ghost, button.row {
-  background: transparent;
-  color: inherit;
+button {
+  min-block-size: 40px;
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--on-accent);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition:
+    background-color 120ms ease-out,
+    transform 120ms ease-out;
+}
+
+button:active {
+  transform: scale(0.98);
 }
 
 button:disabled {
-  opacity: 0.6;
+  opacity: 0.55;
   cursor: default;
+  transform: none;
 }
 
-button.row {
-  width: 100%;
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  text-align: left;
+button.ghost {
+  font-weight: 500;
+  color: var(--ink);
+  background: transparent;
+  border-color: var(--edge);
 }
 
-button.row.on {
-  background: #fff;
+@media (hover: hover) {
+  button:hover:not(:disabled) {
+    background: color-mix(in oklch, var(--accent) 86%, var(--ink));
+  }
+
+  button.ghost:hover:not(:disabled) {
+    background: color-mix(in oklch, var(--ink) 7%, transparent);
+  }
 }
 
-.list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 8px;
-  align-content: start;
+/* Blocks */
+
+.panel,
+.sheet,
+.sheets {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
 }
 
+.panel,
 .sheet {
-  background: #fff;
-  border: 1px solid #d9d2c5;
+  display: grid;
+  gap: 18px;
   padding: 20px;
 }
 
-ol {
-  padding-left: 18px;
+.create {
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  align-items: end;
 }
 
-li.done {
-  color: #3d6b45;
+.narrow {
+  display: grid;
+  gap: 20px;
+  max-inline-size: 400px;
+  padding-block-start: 12vh;
 }
 
-.muted, .status {
-  display: block;
-  color: #6d675e;
-  font-size: 14px;
+.narrow > button {
+  justify-self: start;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  align-items: start;
+  gap: 24px;
+  margin-block-start: 28px;
+}
+
+.empty {
+  display: grid;
+  place-content: center;
+  min-block-size: 168px;
+  padding: 24px;
+  text-align: center;
+  border: 1px dashed var(--edge);
+  border-radius: var(--radius);
+}
+
+/* Messages */
+
+.error {
+  color: var(--danger);
+  font-weight: 500;
+}
+
+.banner,
+.sheet .error {
+  padding: 10px 14px;
+  background: var(--danger-ground);
+  border-radius: var(--radius);
+}
+
+.banner {
+  margin-block-end: 20px;
+  border: 1px solid currentColor;
+}
+
+/* The list of sheets */
+
+.sheets {
+  overflow: hidden;
+}
+
+.sheets > .label {
+  padding: 12px 14px;
+}
+
+.list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.list li {
+  border-block-start: 1px solid var(--rule);
+}
+
+.list li.muted {
+  padding: 16px 14px;
+}
+
+button.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  inline-size: 100%;
+  min-block-size: 56px;
+  padding: 10px 14px 10px 11px;
+  font-weight: 400;
+  text-align: start;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-inline-start: 3px solid transparent;
+  border-radius: 0;
+  outline-offset: -2px;
+  transform: none;
+}
+
+@media (hover: hover) {
+  button.row:hover {
+    background: color-mix(in oklch, var(--ink) 5%, transparent);
+  }
+}
+
+button.row.on {
+  background: color-mix(in oklch, var(--accent) 10%, transparent);
+  border-inline-start-color: var(--accent);
+}
+
+.row-main {
+  display: grid;
+  gap: 2px;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+.row-main strong {
+  font-weight: 600;
+}
+
+.row-side {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+/* A status is its word plus a mark; the mark is hollow for a draft and filled otherwise. */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.status::before {
+  content: "";
+  box-sizing: border-box;
+  inline-size: 8px;
+  block-size: 8px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+}
+
+.status.running {
+  color: var(--accent);
 }
 
 .status.success {
-  color: #3d6b45;
+  color: var(--success);
 }
 
-.status.failed, .error {
-  color: #8c3a2f;
+.status.failed {
+  color: var(--danger);
 }
 
-@media (max-width: 720px) {
-  .layout {
-    grid-template-columns: 1fr;
+.status.running::before,
+.status.success::before,
+.status.failed::before {
+  background: currentColor;
+}
+
+.status.running::before {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+/* The open sheet */
+
+.sheet-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.sheet-head > div {
+  display: grid;
+  gap: 4px;
+  min-inline-size: 0;
+}
+
+.sheet-head .status {
+  margin-block-start: 5px;
+}
+
+.sheet button {
+  justify-self: start;
+}
+
+.checklist {
+  display: grid;
+  gap: 6px;
+}
+
+.checklist .label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.steps {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.steps li {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-block-size: 40px;
+  color: var(--muted);
+}
+
+/* The mark of a step: a ring while pending, a turning ring on the step in hand, a tick when done. */
+.steps li::before {
+  content: "";
+  flex: none;
+  box-sizing: border-box;
+  inline-size: 20px;
+  block-size: 20px;
+  border: 2px solid var(--edge);
+  border-radius: 50%;
+  transition:
+    background-color 200ms ease-out,
+    border-color 200ms ease-out;
+}
+
+/* The line from the mark above down to this one. */
+.steps li + li::after {
+  content: "";
+  position: absolute;
+  inset-block-start: calc(10px - 50%);
+  inset-inline-start: 9px;
+  inline-size: 2px;
+  block-size: calc(100% - 20px);
+  background: var(--edge);
+}
+
+.steps li.done {
+  color: var(--ink);
+}
+
+.steps li.done::before {
+  background: var(--success);
+  border-color: var(--success);
+  /* The tick is cut out of the mark, so it takes the colour of whatever is behind. */
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath fill-rule='evenodd' d='M0 0h20v20H0z M4.5 10.5l1.4-1.4 2.5 2.5 5.7-6.2 1.5 1.3-7.1 7.8z'/%3E%3C/svg%3E")
+    center / 100% 100%;
+}
+
+.steps li.done + li::after {
+  background: var(--success);
+}
+
+.steps li[aria-current="step"] {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.steps li[aria-current="step"]::before {
+  border-color: var(--accent);
+  border-inline-end-color: transparent;
+  animation: spin 900ms linear infinite;
+}
+
+.meta {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 16px;
+  margin: 0;
+  padding-block-start: 16px;
+  font-size: 0.875rem;
+  border-block-start: 1px solid var(--rule);
+}
+
+.meta dt {
+  color: var(--muted);
+}
+
+.meta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.meta code {
+  font-family: var(--mono);
+  font-size: 0.8125rem;
+}
+
+@keyframes spin {
+  to {
+    rotate: 1turn;
+  }
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* A finger needs a larger target than a pointer. */
+@media (pointer: coarse) {
+  button,
+  input,
+  .steps li {
+    min-block-size: 44px;
+  }
+}
+
+@media (max-width: 760px) {
+  main {
+    padding-inline: 16px;
+  }
+
+  .layout,
+  .create {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Nothing turns or fades for a reader who asked for less motion; the step in hand keeps a still mark. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  .steps li[aria-current="step"]::before {
+    border-inline-end-color: var(--accent);
+    background: radial-gradient(circle, var(--accent) 0 3px, transparent 3.5px);
   }
 }
